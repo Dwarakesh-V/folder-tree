@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+Directory tree printer with gitignore-style filtering.
+
+Usage:
+    tree.py <folder> [--ignore PATTERN ...] [--ignore-file FILE]
+
+Examples:
+    tree.py .
+    tree.py . --ignore "*.pyc" "__pycache__" ".git"
+    tree.py . --ignore-file .gitignore
+    tree.py . --ignore "*.log" --ignore-file .gitignore
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+
+def _try_import_pathspec():
+    try:
+        import pathspec
+        return pathspec
+    except ImportError:
+        return None
+
+def build_spec(patterns, pathspec_mod):
+    """Compile a list of gitignore-style patterns into a matcher."""
+    if not patterns:
+        return None
+    if pathspec_mod:
+        return pathspec_mod.PathSpec.from_lines("gitwildmatch", patterns)
+    # Fallback: keep raw patterns for fnmatch-based matching
+    return patterns
+
+
+def is_ignored(path: Path, root: Path, spec, pathspec_mod) -> bool:
+    """Return True if *path* matches any ignore pattern."""
+    if spec is None:
+        return False
+
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+
+    rel_str = str(rel).replace(os.sep, "/")
+
+    if pathspec_mod and hasattr(spec, "match_file"):
+        # pathspec handles gitignore semantics fully (negation, dir-only, etc.)
+        if path.is_dir():
+            return spec.match_file(rel_str) or spec.match_file(rel_str + "/")
+        return spec.match_file(rel_str)
+
+    # fnmatch against both the bare name and the relative path
+    import fnmatch
+    name = path.name
+    for pattern in spec:
+        bare = pattern.rstrip("/")
+        if fnmatch.fnmatch(name, bare) or fnmatch.fnmatch(rel_str, bare):
+            return True
+    return False
+
+def collect_patterns(cli_patterns: list[str], ignore_file: str | None,
+                     auto_gitignore: Path | None) -> list[str]:
+    """
+    Merge patterns from three sources (in priority order):
+      1. Patterns passed directly on the CLI (--ignore)
+      2. A file explicitly named with --ignore-file
+      3. A .gitignore auto-detected in the target directory (lowest priority)
+    """
+    patterns: list[str] = []
+
+    def _read_file(filepath: Path) -> list[str]:
+        result = []
+        try:
+            with filepath.open() as fh:
+                for raw in fh:
+                    line = raw.rstrip("\n")
+                    if line and not line.startswith("#"):
+                        result.append(line)
+        except OSError as exc:
+            print(f"Warning: cannot read '{filepath}': {exc}", file=sys.stderr)
+        return result
+
+    # Auto .gitignore (added first so explicit flags can override via negation)
+    if auto_gitignore and auto_gitignore.is_file():
+        patterns.extend(_read_file(auto_gitignore))
+
+    # Explicit ignore-file
+    if ignore_file:
+        p = Path(ignore_file)
+        if p.is_file():
+            patterns.extend(_read_file(p))
+        else:
+            print(f"Warning: --ignore-file '{ignore_file}' not found.", file=sys.stderr)
+
+    # Direct CLI patterns (highest priority — appended last so pathspec negation works)
+    if cli_patterns:
+        patterns.extend(cli_patterns)
+
+    return patterns
+
+def print_tree(path: Path, root: Path, spec, pathspec_mod,
+               prefix: str = "", is_last: bool = True) -> None:
+    """Recursively print one node of the directory tree."""
+    connector = "└── " if is_last else "├── "
+    print(f"{prefix}{connector}{path.name}")
+
+    if not path.is_dir():
+        return
+
+    try:
+        children = sorted(path.iterdir(),
+                          key=lambda x: (not x.is_dir(), x.name.lower()))
+    except PermissionError:
+        return
+
+    # Apply ignore filter
+    children = [c for c in children
+                if not is_ignored(c, root, spec, pathspec_mod)]
+
+    extension = "    " if is_last else "│   "
+    new_prefix = prefix + extension
+
+    for i, child in enumerate(children):
+        print_tree(child, root, spec, pathspec_mod,
+                   new_prefix, i == len(children) - 1)
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Print a directory tree with optional gitignore-style filtering.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("folder", help="Root directory to display.")
+    parser.add_argument(
+        "--ignore",
+        nargs="+",
+        metavar="PATTERN",
+        default=[],
+        help=(
+            "One or more gitignore-style patterns to exclude. "
+            "Quote patterns that contain wildcards. "
+            "Example: --ignore '*.pyc' '__pycache__' '.git'"
+        ),
+    )
+    parser.add_argument(
+        "--ignore-file",
+        metavar="FILE",
+        help=(
+            "Path to a gitignore-style file whose patterns are applied in "
+            "addition to --ignore. Example: --ignore-file .gitignore"
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-gitignore",
+        action="store_true",
+        help=(
+            "Disable automatic loading of a .gitignore found in the target "
+            "directory (enabled by default when one is present)."
+        ),
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    folder_path = Path(args.folder).resolve()
+
+    if not folder_path.exists():
+        print(f"Error: path '{folder_path}' does not exist.", file=sys.stderr)
+        sys.exit(1)
+    if not folder_path.is_dir():
+        print(f"Error: '{folder_path}' is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    # pathspec gives gitignore semantics; fall back to
+    pathspec_mod = _try_import_pathspec()
+    if (args.ignore or args.ignore_file) and pathspec_mod is None:
+        print(
+            "Warning: 'pathspec' is not installed. "
+            "Install it for full gitignore support:\n"
+            "  pip install pathspec\n"
+            "Falling back to basic glob matching.",
+            file=sys.stderr,
+        )
+
+    # Auto-detect .gitignore unless suppressed
+    auto_gi = None if args.no_auto_gitignore else folder_path / ".gitignore"
+
+    patterns = collect_patterns(args.ignore, args.ignore_file, auto_gi)
+    spec = build_spec(patterns, pathspec_mod)
+
+    # Print root label
+    print(folder_path.name or str(folder_path))
+
+    try:
+        top_items = sorted(folder_path.iterdir(),
+                           key=lambda x: (not x.is_dir(), x.name.lower()))
+    except PermissionError:
+        print("Error: permission denied.", file=sys.stderr)
+        sys.exit(1)
+
+    top_items = [item for item in top_items
+                 if not is_ignored(item, folder_path, spec, pathspec_mod)]
+
+    for i, item in enumerate(top_items):
+        print_tree(item, folder_path, spec, pathspec_mod, "", i == len(top_items) - 1)
+
+
+if __name__ == "__main__":
+    main()
